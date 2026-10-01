@@ -16,7 +16,11 @@ export async function extractPdf(buffer: Buffer | Uint8Array): Promise<Extracted
   // @ts-ignore pdfjs legacy build — module typing not exported
   const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
 
-  const data = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+  const data = new Uint8Array(
+    buffer.buffer,
+    buffer.byteOffset,
+    buffer.byteLength
+  );
 
   let pdfDoc: any;
   try {
