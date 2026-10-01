@@ -5,7 +5,7 @@ import { documents, pages, chunks } from "@/lib/schema";
 import { getFile } from "@/lib/storage";
 import { extractPdf } from "@/lib/extraction/pdf";
 import { extractDocx } from "@/lib/extraction/docx";
-import { chunkDocument } from "@/lib/extraction/chunker";
+import { chunkDocument } from "@/lib/chunk/chunk";
 
 export const maxDuration = 60;
 
@@ -133,40 +133,28 @@ export async function POST(
       await db.insert(pages).values(pageRows);
     }
 
-    // 8. Chunk + persist chunks
-    const chunkList = chunkDocument(extracted.canonicalText, extracted.pages);
-    if (chunkList.length > 0) {
-      const chunkRows = chunkList.map((c) => ({
-        documentId: id,
-        idx: c.idx,
-        startOffset: c.startOffset,
-        endOffset: c.endOffset,
-        pageStart: c.pageStart,
-        pageEnd: c.pageEnd,
-        sectionLabel: c.sectionLabel,
-        text: c.text,
-      }));
-      // Insert in batches of 200 to avoid huge queries
-      for (let i = 0; i < chunkRows.length; i += 200) {
-        await db.insert(chunks).values(chunkRows.slice(i, i + 200));
-      }
-    }
+    // 8. Update canonical text and html content
+    await db
+      .update(documents)
+      .set({
+        pageCount: extracted.pageCount,
+        canonicalText: extracted.canonicalText,
+        htmlContent: extracted.htmlContent ?? null,
+      })
+      .where(eq(documents.id, id));
 
-    // 9. Mark ready
+    // 9. Chunk canonical text and persist chunks via lib/chunk/chunk
+    const chunkList = await chunkDocument(id);
+
+    // 10. Mark ready
     await db
       .update(documents)
       .set({
         status: "ready",
         statusDetail: `${extracted.pageCount} pages · ${chunkList.length} clauses indexed`,
-        pageCount: extracted.pageCount,
-        canonicalText: extracted.canonicalText,
-        htmlContent: extracted.htmlContent ?? null,
         errorMessage: null,
       })
       .where(eq(documents.id, id));
-
-    // 10. Stub chunking hook (prompt 3 implements the real embedding pipeline)
-    await chunkDocumentStub(id);
 
     return NextResponse.json({
       ok: true,
@@ -193,13 +181,4 @@ export async function POST(
       { status: 500 }
     );
   }
-}
-
-/**
- * Stub hook — will be implemented in prompt 3 (embedding / vector chunk pipeline).
- * Called after successful extraction to kick off the AI indexing step.
- */
-async function chunkDocumentStub(documentId: string): Promise<void> {
-  // No-op until prompt 3
-  void documentId;
 }
