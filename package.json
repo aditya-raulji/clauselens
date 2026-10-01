@@ -8,6 +8,7 @@
     "start": "next start",
     "lint": "eslint",
     "test": "vitest run",
+    "fixtures": "npx tsx scripts/make-large-fixture.ts",
     "db:push": "drizzle-kit push"
   },
   "dependencies": {
