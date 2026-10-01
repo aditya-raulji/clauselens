@@ -12,6 +12,23 @@ const envSchema = z.object({
 });
 
 function validateEnv() {
+  // During Next.js static build phase, skip validation so build doesn't crash
+  // on empty .env.local. Validation still runs at server request time.
+  const isBuildPhase =
+    process.env.NEXT_PHASE === "phase-production-build" ||
+    process.env.NEXT_PHASE === "phase-export";
+
+  if (isBuildPhase) {
+    return {
+      AI_API_KEY: process.env.AI_API_KEY || "__build_placeholder__",
+      AI_BASE_URL: process.env.AI_BASE_URL || "https://api.groq.com/openai/v1",
+      AI_MODEL: process.env.AI_MODEL || "__build_placeholder__",
+      AI_FALLBACK_MODELS: process.env.AI_FALLBACK_MODELS || "",
+      DATABASE_URL: process.env.DATABASE_URL || "__build_placeholder__",
+      fallbackModels: [] as string[],
+    };
+  }
+
   const parsed = envSchema.safeParse({
     AI_API_KEY: process.env.AI_API_KEY,
     AI_BASE_URL: process.env.AI_BASE_URL || "https://api.groq.com/openai/v1",
