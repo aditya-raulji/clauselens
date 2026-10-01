@@ -1,16 +1,12 @@
 /**
  * app/api/chat/route.ts
  *
- * Streaming contract chat endpoint (Server-Sent Events).
- *
- * Events:
- *  - meta { messageId, conversationId }
- *  - status { text }
- *  - token { text }
- *  - quotes { items }
- *  - coverage { ... }
- *  - done {}
- *  - error { message, retryable }
+ * Streaming contract chat endpoint (Server-Sent Events) with:
+ *  - Small doc full-context mode (<= 9,000 tokens)
+ *  - Larger doc retrieval mode with legal synonym query expansion
+ *  - Deep scan mode for existence/absence questions across 150+ page contracts
+ *  - Hard invariant rule: guardApproved intercepts absence claims on partial reads
+ *  - Stop / abort handling, rate-limit propagation, and DB persistence
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -25,6 +21,12 @@ import {
   parseQuotesJson,
   verifyExtractedQuotes,
 } from "@/lib/chat/streamParser";
+import { guardApproved, CoverageObject } from "@/lib/coverage";
+import {
+  isExistenceOrAbsenceQuestion,
+  estimateScan,
+  runDeepScan,
+} from "@/lib/chat/deepScan";
 
 export const maxDuration = 60;
 
@@ -40,10 +42,12 @@ export async function POST(req: NextRequest) {
     documentId,
     question,
     conversationId: requestedConvId,
+    mode = "auto", // "auto" | "scan" | "estimate" | "quick"
   }: {
     documentId?: string;
     question?: string;
     conversationId?: string;
+    mode?: "auto" | "scan" | "estimate" | "quick";
   } = body;
 
   if (!documentId || !question?.trim()) {
@@ -82,7 +86,7 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // 2. Fetch pages for offset-to-page resolution
+  // 2. Fetch pages
   const docPages = await db
     .select({
       pageNumber: pages.pageNumber,
@@ -109,7 +113,6 @@ export async function POST(req: NextRequest) {
     .orderBy(asc(chunks.idx));
 
   if (docChunks.length === 0) {
-    // Generate chunks if not yet created
     const generated = await chunkDocument(documentId);
     docChunks = generated.map((c) => ({
       idx: c.idx,
@@ -120,6 +123,24 @@ export async function POST(req: NextRequest) {
       sectionLabel: c.sectionLabel,
       text: c.text,
     }));
+  }
+
+  const mappedChunks = docChunks.map((c) => ({
+    ...c,
+    sectionLabel: c.sectionLabel || "General Provisions",
+  }));
+
+  const totalPages =
+    doc.pageCount && doc.pageCount > 0
+      ? doc.pageCount
+      : docPages.length > 0
+      ? docPages[docPages.length - 1].pageNumber
+      : Math.max(...mappedChunks.map((c) => c.pageEnd), 1);
+
+  // If client simply requested an estimate for deep scan
+  if (mode === "estimate") {
+    const estimate = estimateScan(mappedChunks, totalPages);
+    return NextResponse.json({ estimate });
   }
 
   // 4. Find or create conversation
@@ -158,7 +179,83 @@ export async function POST(req: NextRequest) {
     status: "complete",
   });
 
-  // 6. Fetch recent conversation history (last 4 messages before this new one)
+  const assistantMessageId = crypto.randomUUID();
+  const encoder = new TextEncoder();
+
+  // Check if this is an explicit Deep Scan request
+  if (mode === "scan") {
+    const { topic } = isExistenceOrAbsenceQuestion(question);
+
+    const stream = new ReadableStream({
+      async start(controller) {
+        function send(event: string, data: any) {
+          try {
+            controller.enqueue(
+              encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+            );
+          } catch {}
+        }
+
+        send("meta", { messageId: assistantMessageId, conversationId: conv.id });
+        send("status", { text: `Starting full document scan for "${topic}"…` });
+
+        try {
+          const scanResult = await runDeepScan({
+            topic,
+            documentName: doc.name,
+            canonicalText: doc.canonicalText!,
+            docPages,
+            chunks: mappedChunks,
+            signal: req.signal,
+            onProgress: (p) => {
+              send("scan_progress", p);
+              send("status", { text: p.statusText });
+            },
+            onRateLimited: (retryInSec) => {
+              send("status", {
+                text: `AI provider busy during scan, retrying in ${retryInSec}s...`,
+              });
+            },
+          });
+
+          // Post-process with absence guard
+          const guarded = guardApproved(scanResult.answer, scanResult.coverage);
+
+          // Stream final answer token
+          send("token", { text: guarded.text });
+          send("quotes", { items: scanResult.quotes });
+          send("coverage", scanResult.coverage);
+
+          // Save assistant message
+          await db.insert(messages).values({
+            id: assistantMessageId,
+            conversationId: conv.id,
+            role: "assistant",
+            content: guarded.text,
+            status: scanResult.status,
+            quotes: scanResult.quotes,
+            coverage: scanResult.coverage,
+          });
+
+          send("done", {});
+          controller.close();
+        } catch (err: any) {
+          send("error", { message: err?.message || "Deep scan failed", retryable: true });
+          controller.close();
+        }
+      },
+    });
+
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+      },
+    });
+  }
+
+  // 6. Normal Chat Path (Hybrid: Full-context for small docs, Retrieval for large docs)
   const pastMessages = await db
     .select({
       role: messages.role,
@@ -176,22 +273,17 @@ export async function POST(req: NextRequest) {
     content: string;
   }>;
 
-  // 7. Assemble token-budgeted prompt and BM25 excerpts
+  // Assemble prompt with hybrid strategy (full-context for small docs, BM25 + legal synonyms for larger)
   const context = assembleChatPrompt({
     documentId,
     documentName: doc.name,
     question: question.trim(),
-    chunks: docChunks.map((c) => ({
-      ...c,
-      sectionLabel: c.sectionLabel || "General Provisions",
-    })),
+    chunks: mappedChunks,
+    canonicalText: doc.canonicalText!,
+    totalPages,
     history,
   });
 
-  const assistantMessageId = crypto.randomUUID();
-
-  // 8. Setup Server-Sent Events stream
-  const encoder = new TextEncoder();
   const stripper = new QuotesStreamStripper();
   let hasSavedMessage = false;
 
@@ -202,18 +294,16 @@ export async function POST(req: NextRequest) {
           controller.enqueue(
             encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
           );
-        } catch {
-          // Stream might be closed by client abort
-        }
+        } catch {}
       }
 
-      // Initial metadata & coverage
-      send("meta", {
-        messageId: assistantMessageId,
-        conversationId: conv.id,
-      });
+      send("meta", { messageId: assistantMessageId, conversationId: conv.id });
 
-      send("status", { text: "Searching relevant contract clauses…" });
+      const statusMsg =
+        context.coverage.mode === "full"
+          ? "Analyzing full document text (100% in-context)…"
+          : "Retrieving relevant clauses with legal query expansion…";
+      send("status", { text: statusMsg });
       send("coverage", context.coverage);
 
       try {
@@ -245,11 +335,9 @@ export async function POST(req: NextRequest) {
           }
         }
 
-        // Finalize stream
         const { visibleText, quotesRaw } = stripper.flush();
 
         if (req.signal.aborted) {
-          // Client pressed Stop (AbortController)
           if (!hasSavedMessage) {
             hasSavedMessage = true;
             await db.insert(messages).values({
@@ -276,14 +364,22 @@ export async function POST(req: NextRequest) {
           docPages
         );
 
-        // Save completed assistant message with verified quotes
+        // HARD INVARIANT RULE: Intercept absence claims on incomplete coverage
+        const guarded = guardApproved(visibleText, context.coverage);
+
+        if (guarded.wasGuarded) {
+          // If the answer was guarded with mandatory disclosure, send the disclosure update
+          send("guarded_disclosure", { disclosure: guarded.disclosure });
+        }
+
+        // Save completed assistant message with verified quotes and post-processed content
         if (!hasSavedMessage) {
           hasSavedMessage = true;
           await db.insert(messages).values({
             id: assistantMessageId,
             conversationId: conv.id,
             role: "assistant",
-            content: visibleText,
+            content: guarded.text,
             status: "complete",
             quotes: verifiedQuotes,
             coverage: context.coverage,
