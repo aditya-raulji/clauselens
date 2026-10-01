@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
-import { eq } from "drizzle-orm";
+import { eq, asc } from "drizzle-orm";
 import { db } from "@/lib/db";
-import { documents } from "@/lib/schema";
+import { documents, pages } from "@/lib/schema";
 
 export async function GET(
   _req: NextRequest,
@@ -20,6 +20,7 @@ export async function GET(
         statusDetail: documents.statusDetail,
         errorMessage: documents.errorMessage,
         pageCount: documents.pageCount,
+        canonicalText: documents.canonicalText,
         htmlContent: documents.htmlContent,
         createdAt: documents.createdAt,
       })
@@ -31,7 +32,18 @@ export async function GET(
       return NextResponse.json({ error: "Document not found" }, { status: 404 });
     }
 
-    return NextResponse.json({ document: doc });
+    const docPages = await db
+      .select({
+        id: pages.id,
+        pageNumber: pages.pageNumber,
+        startOffset: pages.startOffset,
+        endOffset: pages.endOffset,
+      })
+      .from(pages)
+      .where(eq(pages.documentId, id))
+      .orderBy(asc(pages.pageNumber));
+
+    return NextResponse.json({ document: doc, pages: docPages });
   } catch (error: any) {
     return NextResponse.json(
       { error: "Failed to fetch document", details: error?.message },
