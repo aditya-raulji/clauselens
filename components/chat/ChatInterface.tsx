@@ -2,7 +2,6 @@
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import ReactMarkdown from "react-markdown";
 import {
   Send,
   Square,
@@ -17,10 +16,12 @@ import {
   ChevronDown,
   ChevronUp,
   Sparkles,
-  RefreshCw,
-  Clock,
   ArrowDown,
   Info,
+  Radar,
+  Gauge,
+  Layers,
+  HelpCircle,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -28,7 +29,8 @@ import { Spinner } from "@/components/ui/spinner";
 import { EmptyState } from "@/components/ui/empty-state";
 import { ErrorState } from "@/components/ui/error-state";
 import { VerifiedQuoteItem } from "@/lib/chat/streamParser";
-import { ChatCoverage } from "@/lib/chat/prompt";
+import { CoverageObject } from "@/lib/coverage";
+import { isExistenceOrAbsenceQuestion, ScanEstimate } from "@/lib/chat/deepScan";
 
 export interface ConversationSummary {
   id: string;
@@ -42,7 +44,7 @@ export interface ChatMessageUI {
   content: string;
   status: "complete" | "stopped" | "error";
   quotes?: VerifiedQuoteItem[] | null;
-  coverage?: ChatCoverage | null;
+  coverage?: CoverageObject | null;
   createdAt?: string;
   isStreaming?: boolean;
 }
@@ -53,9 +55,9 @@ interface ChatInterfaceProps {
 }
 
 const SUGGESTED_QUESTIONS = [
+  "Does this agreement contain a non-compete clause?",
   "What are the termination and notice requirements?",
-  "Are there indemnification or limitation of liability caps?",
-  "What are the governing law and dispute resolution terms?",
+  "Is there an indemnification or limitation of liability cap?",
 ];
 
 export function ChatInterface({
@@ -66,6 +68,7 @@ export function ChatInterface({
   const [docId, setDocId] = useState<string | undefined>(propDocId);
   const [docName, setDocName] = useState<string>("");
   const [pageCount, setPageCount] = useState<number>(0);
+  const [chunkCount, setChunkCount] = useState<number>(0);
   const [docList, setDocList] = useState<Array<{ id: string; name: string; pageCount: number }>>([]);
   const [docLoading, setDocLoading] = useState(false);
 
@@ -80,6 +83,30 @@ export function ChatInterface({
   const [streamStatus, setStreamStatus] = useState<string | null>(null);
   const [fetchError, setFetchError] = useState<string | null>(null);
 
+  // Deep Scan state
+  const [scanProgress, setScanProgress] = useState<{
+    currentBatch: number;
+    totalBatches: number;
+    pageStart: number;
+    pageEnd: number;
+    totalPages: number;
+    statusText: string;
+  } | null>(null);
+  const [pendingScanConfirm, setPendingScanConfirm] = useState<{
+    question: string;
+    estimate: ScanEstimate;
+  } | null>(null);
+
+  // Usage meter state
+  const [usage, setUsage] = useState<{
+    todayTokens: number;
+    dailyLimit: number;
+    percentage: number;
+  }>({ todayTokens: 0, dailyLimit: 200000, percentage: 0 });
+
+  // Expandable coverage panels state (by messageId)
+  const [expandedCoverage, setExpandedCoverage] = useState<Record<string, boolean>>({});
+
   // Auto-scroll state
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -87,7 +114,21 @@ export function ChatInterface({
   const abortControllerRef = useRef<AbortController | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  // 1. Fetch available documents if no documentId provided
+  // 1. Fetch available documents and load usage
+  const fetchUsage = useCallback(async () => {
+    try {
+      const res = await fetch("/api/usage");
+      if (res.ok) {
+        const data = await res.json();
+        setUsage(data);
+      }
+    } catch {}
+  }, []);
+
+  useEffect(() => {
+    fetchUsage();
+  }, [fetchUsage]);
+
   useEffect(() => {
     async function loadDocuments() {
       try {
@@ -100,15 +141,19 @@ export function ChatInterface({
           );
           setDocList(readyDocs);
 
-          if (!docId && readyDocs.length > 0) {
-            setDocId(readyDocs[0].id);
-            setDocName(readyDocs[0].name);
-            setPageCount(readyDocs[0].pageCount || 0);
-          } else if (docId) {
-            const current = readyDocs.find((d: any) => d.id === docId);
-            if (current) {
-              setDocName(current.name);
-              setPageCount(current.pageCount || 0);
+          const target = docId
+            ? readyDocs.find((d: any) => d.id === docId)
+            : readyDocs[0];
+
+          if (target) {
+            setDocId(target.id);
+            setDocName(target.name);
+            setPageCount(target.pageCount || 0);
+
+            // Fetch chunks count
+            if (target.statusDetail) {
+              const match = target.statusDetail.match(/(\d+)\s+clauses/i);
+              if (match) setChunkCount(parseInt(match[1], 10));
             }
           }
         }
@@ -174,9 +219,8 @@ export function ChatInterface({
     if (!showScrollBottom) {
       scrollToBottom("auto");
     }
-  }, [messages, streaming]);
+  }, [messages, streaming, scanProgress]);
 
-  // Detect scroll offset for "Jump to latest" button
   const handleScroll = () => {
     if (!scrollContainerRef.current) return;
     const { scrollTop, scrollHeight, clientHeight } = scrollContainerRef.current;
@@ -184,20 +228,50 @@ export function ChatInterface({
     setShowScrollBottom(distFromBottom > 150);
   };
 
-  // 5. Send message with SSE Streaming & Stop support
-  const handleSend = async (questionText?: string) => {
+  // 5. Send message with SSE Streaming, Deep Scan & Stop support
+  const handleSend = async (
+    questionText?: string,
+    forcedMode: "auto" | "scan" | "quick" = "auto"
+  ) => {
     const q = (questionText || inputQuestion).trim();
     if (!q || streaming || !docId) return;
 
+    // Check if this is an existence question on a large document (>= 15 pages) and in auto mode
+    const isExistence = isExistenceOrAbsenceQuestion(q).isExistence;
+    if (forcedMode === "auto" && isExistence && pageCount >= 15 && !pendingScanConfirm) {
+      // Fetch scan estimate and request confirmation first
+      try {
+        const estRes = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            documentId: docId,
+            question: q,
+            mode: "estimate",
+          }),
+        });
+        if (estRes.ok) {
+          const { estimate } = await estRes.json();
+          setPendingScanConfirm({ question: q, estimate });
+          return;
+        }
+      } catch {}
+    }
+
+    setPendingScanConfirm(null);
     setInputQuestion("");
     setFetchError(null);
     setStreaming(true);
-    setStreamStatus("Analyzing query…");
+    setScanProgress(null);
+    setStreamStatus(
+      forcedMode === "scan"
+        ? "Starting full document deep scan…"
+        : "Analyzing query…"
+    );
 
     const tempUserMsgId = crypto.randomUUID();
     const tempAssistantMsgId = crypto.randomUUID();
 
-    // Optimistically add user message and empty streaming assistant bubble
     const userMsg: ChatMessageUI = {
       id: tempUserMsgId,
       role: "user",
@@ -229,6 +303,7 @@ export function ChatInterface({
           documentId: docId,
           question: q,
           conversationId: activeConvId,
+          mode: forcedMode,
         }),
         signal: abortController.signal,
       });
@@ -293,6 +368,10 @@ export function ChatInterface({
                 setStreamStatus(parsed.text);
                 break;
 
+              case "scan_progress":
+                setScanProgress(parsed);
+                break;
+
               case "token":
                 setMessages((prev) =>
                   prev.map((m) =>
@@ -349,11 +428,10 @@ export function ChatInterface({
                       : m
                   )
                 );
+                fetchUsage();
                 break;
             }
-          } catch {
-            // Ignore JSON parse error on malformed chunk
-          }
+          } catch {}
         }
       }
     } catch (err: any) {
@@ -387,6 +465,7 @@ export function ChatInterface({
     } finally {
       setStreaming(false);
       setStreamStatus(null);
+      setScanProgress(null);
       abortControllerRef.current = null;
     }
   };
@@ -403,6 +482,7 @@ export function ChatInterface({
     setMessages([]);
     setInputQuestion("");
     setFetchError(null);
+    setPendingScanConfirm(null);
   };
 
   const handleDeleteConversation = async (convIdToDelete: string, e: React.MouseEvent) => {
@@ -435,7 +515,13 @@ export function ChatInterface({
     }
   };
 
-  // Helper to replace [1], [2] in markdown text with interactive citation badges
+  const toggleCoverage = (messageId: string) => {
+    setExpandedCoverage((prev) => ({
+      ...prev,
+      [messageId]: !prev[messageId],
+    }));
+  };
+
   const renderTextWithCitations = (
     text: string,
     messageId: string,
@@ -470,7 +556,7 @@ export function ChatInterface({
 
   return (
     <div className="flex h-[calc(100vh-68px)] w-full overflow-hidden bg-[#F7F5F0]">
-      {/* ─── LEFT SIDEBAR: Conversations & Document Switcher ─── */}
+      {/* ─── LEFT SIDEBAR: Conversations, Usage Meter & Contract Info ─── */}
       <aside className="w-72 flex-shrink-0 border-r border-[#E7E2D9] bg-[#FCFBF8] flex flex-col justify-between">
         <div className="flex flex-col h-full overflow-hidden">
           {/* Header */}
@@ -507,12 +593,23 @@ export function ChatInterface({
                   {docName || "No Contract Selected"}
                 </h2>
                 {pageCount > 0 && (
-                  <p className="text-[11px] text-[#77736C]">
-                    {pageCount} page{pageCount !== 1 ? "s" : ""}
+                  <p className="text-[11px] text-[#77736C] flex items-center gap-1.5 mt-0.5">
+                    <span>{pageCount} pages</span>
+                    {chunkCount > 0 && <span>· {chunkCount} clauses</span>}
                   </p>
                 )}
               </div>
             </div>
+
+            {/* Document-level readiness badge */}
+            {docId && (
+              <div className="mt-2.5 flex items-center gap-1.5 px-2 py-1 bg-[#3F7D58]/10 border border-[#3F7D58]/20 rounded-[8px] text-[11px] text-[#3F7D58]">
+                <CheckCircle2 className="w-3 h-3 flex-shrink-0" />
+                <span className="font-medium truncate">
+                  Ready for questions ({pageCount} pages indexed)
+                </span>
+              </div>
+            )}
 
             <Button
               variant="secondary"
@@ -533,7 +630,7 @@ export function ChatInterface({
 
             {conversations.length === 0 ? (
               <div className="text-center py-6 px-3">
-                <Clock className="w-5 h-5 mx-auto text-[#77736C]/60 mb-1.5" />
+                <MessageSquare className="w-5 h-5 mx-auto text-[#77736C]/60 mb-1.5" />
                 <p className="text-xs text-[#77736C]">No previous chats</p>
                 <p className="text-[11px] text-[#77736C]/80 mt-0.5">
                   Ask a question to start.
@@ -568,6 +665,33 @@ export function ChatInterface({
                 );
               })
             )}
+          </div>
+
+          {/* Usage Meter Card */}
+          <div className="p-3 border-t border-[#E7E2D9] bg-[#FCFBF8]">
+            <div className="flex items-center justify-between mb-1.5">
+              <span className="text-[11px] font-semibold text-[#77736C] flex items-center gap-1">
+                <Gauge className="w-3 h-3 text-[#5267A8]" />
+                Daily AI Usage
+              </span>
+              <span className="text-[10px] font-mono text-[#77736C]">
+                {usage.percentage}%
+              </span>
+            </div>
+
+            <div className="w-full bg-[#E7E2D9] rounded-full h-1.5 overflow-hidden">
+              <div
+                className={`h-full transition-all duration-500 ${
+                  usage.percentage > 85 ? "bg-red-500" : "bg-[#5267A8]"
+                }`}
+                style={{ width: `${Math.max(2, usage.percentage)}%` }}
+              />
+            </div>
+
+            <div className="flex items-center justify-between mt-1 text-[10px] text-[#77736C]">
+              <span>{usage.todayTokens.toLocaleString()} tokens</span>
+              <span>200K quota</span>
+            </div>
           </div>
 
           {/* Document Switcher dropdown if multiple documents available */}
@@ -644,7 +768,7 @@ export function ChatInterface({
                 Zero-Hallucination Contract Intelligence
               </h3>
               <p className="text-xs text-[#77736C] max-w-md mb-8">
-                Ask any legal question. Every single claim is code-verified
+                Ask any legal question. Every claim is strictly code-verified
                 against exact quotes in the text.
               </p>
 
@@ -681,7 +805,9 @@ export function ChatInterface({
               hasQuotes &&
               verifiedQuotesCount === 0;
 
-            // Check if answer is a "not in document" style response
+            const isGuardedWarning =
+              !isUser && msg.content.includes("⚠️ Note: I only read pages");
+
             const isNotInDocument =
               !isUser &&
               /does not contain|not found in the provided excerpts|not mentioned in/i.test(
@@ -698,8 +824,6 @@ export function ChatInterface({
                   className={`max-w-[85%] rounded-[16px] p-5 shadow-[0_4px_20px_rgba(0,0,0,0.03)] border transition-all ${
                     isUser
                       ? "bg-[#171717] text-white border-[#171717]"
-                      : isNotInDocument
-                      ? "bg-[#FCFBF8] border-[#E7E2D9] text-[#171717]"
                       : "bg-[#FCFBF8] border-[#E7E2D9] text-[#171717]"
                   }`}
                 >
@@ -721,22 +845,41 @@ export function ChatInterface({
                         </div>
                       )}
 
-                      {/* Not in document notification banner */}
-                      {isNotInDocument && (
-                        <div className="rounded-[10px] bg-[#F7F5F0] border border-[#E7E2D9] p-2 flex items-center gap-2 text-[11px] text-[#77736C]">
-                          <Info className="w-3.5 h-3.5 flex-shrink-0" />
-                          <span>Document does not contain requested terms.</span>
-                        </div>
-                      )}
-
                       {/* Content with parsed citations */}
-                      <div className="text-xs leading-relaxed text-[#171717] space-y-2">
+                      <div className="text-xs leading-relaxed text-[#171717] space-y-2 whitespace-pre-wrap">
                         {renderTextWithCitations(
                           msg.content,
                           msg.id,
                           msg.quotes
                         )}
                       </div>
+
+                      {/* If the answer was guarded because coverage was incomplete, show "Scan full document" action */}
+                      {isGuardedWarning && (
+                        <div className="p-3 bg-[#5267A8]/10 border border-[#5267A8]/30 rounded-[12px] flex items-center justify-between gap-3">
+                          <div className="flex items-center gap-2 text-xs text-[#5267A8]">
+                            <Radar className="w-4 h-4 flex-shrink-0" />
+                            <span>Verify across all {pageCount} pages?</span>
+                          </div>
+                          <Button
+                            variant="secondary"
+                            size="sm"
+                            onClick={() => {
+                              // Find user question that preceded this answer
+                              const idx = messages.findIndex((m) => m.id === msg.id);
+                              const prevQuestion =
+                                idx > 0 && messages[idx - 1].role === "user"
+                                  ? messages[idx - 1].content
+                                  : inputQuestion;
+                              handleSend(prevQuestion, "scan");
+                            }}
+                            className="text-xs bg-white text-[#5267A8] border-[#5267A8]/40 hover:bg-[#5267A8]/15"
+                          >
+                            <Radar className="w-3.5 h-3.5 mr-1 text-[#5267A8]" />
+                            Scan Full Document
+                          </Button>
+                        </div>
+                      )}
 
                       {/* Stopped label */}
                       {msg.status === "stopped" && (
@@ -745,18 +888,81 @@ export function ChatInterface({
                         </div>
                       )}
 
-                      {/* Coverage indicator pill if partial */}
-                      {msg.coverage && !msg.coverage.isFullCoverage && (
-                        <div className="text-[10px] text-[#77736C] bg-[#F7F5F0] border border-[#E7E2D9] rounded-[6px] px-2 py-1 inline-block">
-                          Coverage: {msg.coverage.summaryText}
+                      {/* ─── Coverage Badge under every answer ─── */}
+                      {msg.coverage && (
+                        <div className="pt-2 border-t border-[#E7E2D9]">
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-2">
+                              {msg.coverage.complete ? (
+                                <Badge variant="verified" size="sm">
+                                  <CheckCircle2 className="w-3 h-3 mr-1" />
+                                  Read all {msg.coverage.totalPages} pages
+                                </Badge>
+                              ) : (
+                                <Badge variant="unverified" size="sm">
+                                  <AlertTriangle className="w-3 h-3 mr-1" />
+                                  Read {msg.coverage.pagesRead.length} of {msg.coverage.totalPages} pages
+                                </Badge>
+                              )}
+
+                              <button
+                                onClick={() => toggleCoverage(msg.id)}
+                                className="text-[11px] text-[#77736C] hover:text-[#171717] flex items-center gap-0.5"
+                              >
+                                <span>Details</span>
+                                {expandedCoverage[msg.id] ? (
+                                  <ChevronUp className="w-3 h-3" />
+                                ) : (
+                                  <ChevronDown className="w-3 h-3" />
+                                )}
+                              </button>
+                            </div>
+
+                            {!msg.coverage.complete && (
+                              <button
+                                onClick={() => {
+                                  const idx = messages.findIndex((m) => m.id === msg.id);
+                                  const prevQuestion =
+                                    idx > 0 && messages[idx - 1].role === "user"
+                                      ? messages[idx - 1].content
+                                      : inputQuestion;
+                                  handleSend(prevQuestion, "scan");
+                                }}
+                                className="text-[11px] font-medium text-[#5267A8] hover:underline flex items-center gap-1"
+                              >
+                                <Radar className="w-3 h-3" />
+                                Scan Full Document
+                              </button>
+                            )}
+                          </div>
+
+                          {/* Expandable page breakdown list */}
+                          {expandedCoverage[msg.id] && (
+                            <div className="mt-2.5 p-2.5 bg-[#F7F5F0] rounded-[10px] border border-[#E7E2D9] text-[11px] text-[#77736C] space-y-1">
+                              <p>
+                                <strong>Reading Mode:</strong>{" "}
+                                <span className="capitalize">{msg.coverage.mode}</span> (
+                                {msg.coverage.chunksRead} passages inspected)
+                              </p>
+                              <p>
+                                <strong>Pages Inspected:</strong>{" "}
+                                {msg.coverage.pageRanges || "N/A"}
+                              </p>
+                              <p className="text-[10px] text-[#77736C]/90 italic">
+                                {msg.coverage.summaryText}
+                              </p>
+                            </div>
+                          )}
                         </div>
                       )}
 
-                      {/* Quote Cards Section */}
+                      {/* ─── Quote Cards Section ─── */}
                       {msg.quotes && msg.quotes.length > 0 && (
                         <div className="pt-3 border-t border-[#E7E2D9] space-y-2">
                           <div className="text-[11px] font-semibold text-[#77736C] uppercase tracking-wider flex items-center justify-between">
-                            <span>Verified Sources ({verifiedQuotesCount}/{msg.quotes.length})</span>
+                            <span>
+                              Verified Sources ({verifiedQuotesCount}/{msg.quotes.length})
+                            </span>
                           </div>
 
                           <div className="grid gap-2">
@@ -821,7 +1027,8 @@ export function ChatInterface({
                                     </p>
                                   ) : (
                                     <p className="text-[11px] text-[#77736C]">
-                                      {q.reason || "Not found in the document - it may be paraphrased."}
+                                      {q.reason ||
+                                        "Not found in the document - it may be paraphrased."}
                                     </p>
                                   )}
                                 </div>
@@ -837,8 +1044,100 @@ export function ChatInterface({
             );
           })}
 
+          {/* Deep Scan Progress Bar (AI Blue) */}
+          {scanProgress && (
+            <div className="rounded-[16px] bg-[#FCFBF8] border-2 border-[#5267A8] p-5 shadow-[0_4px_20px_rgba(82,103,168,0.08)] space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 text-xs font-semibold text-[#5267A8]">
+                  <Radar className="w-4 h-4 animate-spin" />
+                  <span>Deep Scanning Entire Agreement</span>
+                </div>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={handleStop}
+                  className="text-xs text-red-600 hover:bg-red-50 border-red-200 h-7 px-2.5"
+                >
+                  <Square className="w-3 h-3 mr-1 fill-red-600 text-red-600" />
+                  Stop Scan
+                </Button>
+              </div>
+
+              {/* Progress bar */}
+              <div className="w-full bg-[#E7E2D9] rounded-full h-2.5 overflow-hidden">
+                <div
+                  className="bg-[#5267A8] h-full transition-all duration-300 rounded-full"
+                  style={{
+                    width: `${Math.min(
+                      100,
+                      Math.round(
+                        (scanProgress.currentBatch / scanProgress.totalBatches) * 100
+                      )
+                    )}%`,
+                  }}
+                />
+              </div>
+
+              <div className="flex items-center justify-between text-xs text-[#77736C]">
+                <span>{scanProgress.statusText}</span>
+                <span className="font-mono text-[11px]">
+                  Batch {scanProgress.currentBatch}/{scanProgress.totalBatches}
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* Pre-Scan Confirmation Card */}
+          {pendingScanConfirm && (
+            <div className="rounded-[16px] bg-[#FCFBF8] border-2 border-[#5267A8]/60 p-5 shadow-md space-y-3">
+              <div className="flex items-center gap-2 text-sm font-semibold text-[#171717]">
+                <Radar className="w-4 h-4 text-[#5267A8]" />
+                <span>Confirm Deep Scan</span>
+              </div>
+              <p className="text-xs text-[#77736C] leading-relaxed">
+                You asked an existence question (<em>"{pendingScanConfirm.question}"</em>).
+                Because this contract is large, answering with 100% certainty requires a full scan:
+              </p>
+              <div className="p-3 bg-[#5267A8]/10 rounded-[10px] text-xs text-[#5267A8] font-medium flex items-center gap-2">
+                <Info className="w-4 h-4 flex-shrink-0" />
+                <span>{pendingScanConfirm.estimate.summaryText}</span>
+              </div>
+              <div className="flex items-center gap-2 pt-1">
+                <Button
+                  variant="primary"
+                  size="sm"
+                  onClick={() => handleSend(pendingScanConfirm.question, "scan")}
+                  className="bg-[#5267A8] hover:bg-[#43548a] text-xs text-white"
+                >
+                  <Radar className="w-3.5 h-3.5 mr-1.5" />
+                  Run Full Deep Scan
+                </Button>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => {
+                    const q = pendingScanConfirm.question;
+                    setPendingScanConfirm(null);
+                    handleSend(q, "quick");
+                  }}
+                  className="text-xs"
+                >
+                  Quick Retrieval Only
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setPendingScanConfirm(null)}
+                  className="text-xs text-[#77736C]"
+                >
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          )}
+
           {/* Active Streaming Indicator */}
-          {streaming && (
+          {streaming && !scanProgress && (
             <div className="flex items-center gap-2 text-xs text-[#77736C] bg-[#FCFBF8] border border-[#E7E2D9] rounded-full px-3 py-1.5 w-fit shadow-sm">
               <Spinner size="sm" className="text-[#F97316]" />
               <span>{streamStatus || "Generating verified answer…"}</span>
