@@ -37,3 +37,23 @@ export async function GET(
     );
   }
 }
+
+/**
+ * DELETE /api/conversations/[id] — delete conversation and cascaded messages
+ */
+export async function DELETE(
+  _req: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const { id } = await params;
+
+  try {
+    await db.delete(conversations).where(eq(conversations.id, id));
+    return NextResponse.json({ ok: true, deletedId: id });
+  } catch (error: any) {
+    return NextResponse.json(
+      { error: "Failed to delete conversation", details: error?.message },
+      { status: 500 }
+    );
+  }
+}

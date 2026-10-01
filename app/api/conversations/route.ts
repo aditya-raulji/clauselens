@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { eq, asc } from "drizzle-orm";
+import { eq, asc, desc } from "drizzle-orm";
 import { db } from "@/lib/db";
 import { conversations, messages, documents } from "@/lib/schema";
 import { aiClient } from "@/lib/ai/client";
@@ -11,14 +11,20 @@ export const maxDuration = 60;
 /**
  * GET /api/conversations — list all conversations
  */
-export async function GET() {
+export async function GET(req: NextRequest) {
   try {
+    const documentId = req.nextUrl.searchParams.get("documentId");
+
     const convList = await db
       .select()
       .from(conversations)
-      .orderBy(asc(conversations.createdAt));
+      .orderBy(desc(conversations.createdAt));
 
-    return NextResponse.json({ conversations: convList });
+    const filtered = documentId
+      ? convList.filter((c) => (c.documentIds as string[])?.includes(documentId))
+      : convList;
+
+    return NextResponse.json({ conversations: filtered });
   } catch (error: any) {
     return NextResponse.json(
       { error: "Failed to list conversations", details: error?.message },
