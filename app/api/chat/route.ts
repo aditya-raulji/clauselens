@@ -1,12 +1,12 @@
-﻿/**
+/**
  * app/api/chat/route.ts
  *
- * Streaming contract chat endpoint (Server-Sent Events) — updated for multi-document support.
+ * Streaming contract chat endpoint (Server-Sent Events) — multi-doc + agent mode.
  *  - Single-doc path: unchanged (documentId field).
  *  - Multi-doc path: documentIds[] field triggers multi-doc mode.
- *  - Per-document quote verification (each quote verified only against its claimed doc).
- *  - Per-document coverage reporting.
- *  - Deep scan, stop/abort, rate-limit propagation unchanged.
+ *  - Agent path: mode="agent" triggers agentic deep research loop with tool calls.
+ *  - Per-document quote verification.
+ *  - Deep scan, stop/abort, rate-limit propagation.
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -29,6 +29,7 @@ import {
   estimateScan,
   runDeepScan,
 } from "@/lib/chat/deepScan";
+import { runAgentLoop, AgentDocContext } from "@/lib/agent/run";
 
 export const maxDuration = 60;
 
@@ -51,7 +52,7 @@ export async function POST(req: NextRequest) {
     documentIds?: string[];
     question?: string;
     conversationId?: string;
-    mode?: "auto" | "scan" | "estimate" | "quick";
+    mode?: "auto" | "scan" | "estimate" | "quick" | "agent";
   } = body;
 
   if (!question?.trim()) {
@@ -75,6 +76,15 @@ export async function POST(req: NextRequest) {
 
   const isMultiDoc = effectiveDocIds.length > 1;
 
+  // ─── AGENT MODE (single or multi-doc) ────────────────────────────────────
+  if (mode === "agent") {
+    return handleAgent(req, {
+      documentIds: effectiveDocIds,
+      question: question.trim(),
+      requestedConvId,
+    });
+  }
+
   // ─── SINGLE-DOC PATH (unchanged) ─────────────────────────────────────────
   if (!isMultiDoc) {
     return handleSingleDoc(req, {
@@ -90,6 +100,169 @@ export async function POST(req: NextRequest) {
     documentIds: effectiveDocIds,
     question: question.trim(),
     requestedConvId,
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AGENT HANDLER
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function handleAgent(
+  req: NextRequest,
+  opts: { documentIds: string[]; question: string; requestedConvId?: string }
+) {
+  const { documentIds, question, requestedConvId } = opts;
+
+  // Load all documents
+  const docRecords = await Promise.all(
+    documentIds.map(async (docId) => {
+      const [doc] = await db
+        .select({ id: documents.id, name: documents.name, status: documents.status, canonicalText: documents.canonicalText, pageCount: documents.pageCount })
+        .from(documents).where(eq(documents.id, docId)).limit(1);
+      return doc;
+    })
+  );
+
+  for (let i = 0; i < docRecords.length; i++) {
+    const doc = docRecords[i];
+    if (!doc) return NextResponse.json({ error: `Document ${documentIds[i]} not found` }, { status: 404 });
+    if (doc.status !== "ready" || !doc.canonicalText)
+      return NextResponse.json({ error: `Document "${doc?.name}" is not ready` }, { status: 422 });
+  }
+
+  // Load pages and chunks
+  const [allDocPages, allDocChunks] = await Promise.all([
+    Promise.all(documentIds.map((docId) =>
+      db.select({ pageNumber: pages.pageNumber, startOffset: pages.startOffset, endOffset: pages.endOffset })
+        .from(pages).where(eq(pages.documentId, docId)).orderBy(asc(pages.pageNumber))
+    )),
+    Promise.all(documentIds.map(async (docId) => {
+      let docChunks = await db
+        .select({ idx: chunks.idx, startOffset: chunks.startOffset, endOffset: chunks.endOffset, pageStart: chunks.pageStart, pageEnd: chunks.pageEnd, sectionLabel: chunks.sectionLabel, text: chunks.text })
+        .from(chunks).where(eq(chunks.documentId, docId)).orderBy(asc(chunks.idx));
+      if (docChunks.length === 0) {
+        const generated = await chunkDocument(docId);
+        docChunks = generated.map((c) => ({ idx: c.idx, startOffset: c.startOffset, endOffset: c.endOffset, pageStart: c.pageStart, pageEnd: c.pageEnd, sectionLabel: c.sectionLabel, text: c.text }));
+      }
+      return docChunks.map((c) => ({ ...c, sectionLabel: c.sectionLabel || "General Provisions", documentId: docId }));
+    })),
+  ]);
+
+  // Build AgentDocContext array
+  const agentDocs: AgentDocContext[] = documentIds.map((docId, i) => {
+    const doc = docRecords[i]!;
+    const docPages = allDocPages[i];
+    const docChunks = allDocChunks[i];
+    const totalPages = doc.pageCount && doc.pageCount > 0
+      ? doc.pageCount
+      : docPages.length > 0 ? docPages[docPages.length - 1].pageNumber
+      : Math.max(...docChunks.map((c) => c.pageEnd), 1);
+
+    return {
+      id: docId,
+      name: doc.name,
+      label: documentIds.length > 1 ? `D${i + 1}` : doc.name,
+      canonicalText: doc.canonicalText!,
+      chunks: docChunks as any,
+      pages: docPages,
+      totalPages,
+    };
+  });
+
+  // Find/create conversation
+  let convId = requestedConvId;
+  let conv: any;
+  if (convId) {
+    const [existing] = await db.select().from(conversations).where(eq(conversations.id, convId)).limit(1);
+    conv = existing;
+  }
+  if (!conv) {
+    const title = question.slice(0, 60) + (question.length > 60 ? "…" : "");
+    const [newConv] = await db.insert(conversations).values({ documentIds, title, mode: "deep" }).returning();
+    conv = newConv; convId = newConv.id;
+  }
+
+  // Save user message
+  await db.insert(messages).values({ conversationId: conv.id, role: "user", content: question, status: "complete" });
+
+  // Load history
+  const pastMessages = await db
+    .select({ role: messages.role, content: messages.content })
+    .from(messages).where(eq(messages.conversationId, conv.id))
+    .orderBy(desc(messages.createdAt)).limit(6);
+  const history = pastMessages.reverse().filter((m) => m.role === "user" || m.role === "assistant") as Array<{ role: "user" | "assistant"; content: string }>;
+
+  const assistantMessageId = crypto.randomUUID();
+  const encoder = new TextEncoder();
+  let hasSavedMessage = false;
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      function send(event: string, data: any) {
+        try { controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)); } catch {}
+      }
+
+      send("meta", { messageId: assistantMessageId, conversationId: conv.id, agentMode: true });
+      send("status", { text: "Starting deep research…" });
+
+      try {
+        let accAnswer = "";
+        const result = await runAgentLoop({
+          docs: agentDocs,
+          primaryDoc: agentDocs[0],
+          question,
+          history,
+          signal: req.signal,
+          onStep: (step) => { send("agent_step", step); },
+          onToken: (text) => { accAnswer += text; send("token", { text }); },
+          onRateLimited: (sec) => { send("status", { text: `Rate limit hit, retrying in ${sec}s…` }); },
+        });
+
+        send("agent_done", {
+          totalRounds: result.totalRounds,
+          stoppedReason: result.stoppedReason,
+          trace: result.trace,
+        });
+        send("quotes", { items: result.quotes });
+        send("coverage", result.coverage);
+
+        if (!hasSavedMessage) {
+          hasSavedMessage = true;
+          await db.insert(messages).values({
+            id: assistantMessageId,
+            conversationId: conv.id,
+            role: "assistant",
+            content: result.answer,
+            status: result.stoppedReason === "aborted" ? "stopped" : "complete",
+            quotes: result.quotes,
+            coverage: result.coverage,
+            trace: result.trace as any,
+          });
+        }
+
+        send("done", {});
+        controller.close();
+      } catch (err: any) {
+        const isAborted = req.signal.aborted || err?.name === "AbortError" || err?.code === "ABORTED";
+        if (!hasSavedMessage) {
+          hasSavedMessage = true;
+          try {
+            await db.insert(messages).values({
+              id: assistantMessageId, conversationId: conv.id, role: "assistant",
+              content: isAborted ? "(Research stopped)" : "(Error during research)",
+              status: isAborted ? "stopped" : "error", quotes: null, coverage: null,
+            });
+          } catch {}
+        }
+        if (isAborted) { send("status", { text: "Research stopped." }); send("done", {}); }
+        else { console.error("Agent SSE error:", err); send("error", { message: err?.message || "Agent research failed", retryable: true }); }
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(stream, {
+    headers: { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive" }
   });
 }
 

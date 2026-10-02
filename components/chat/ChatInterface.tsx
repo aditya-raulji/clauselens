@@ -1,11 +1,12 @@
-﻿"use client";
+"use client";
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import {
   Send, Square, ArrowLeft, FileText, MessageSquare, Plus, Trash2,
   CheckCircle2, AlertTriangle, ExternalLink, ChevronDown, ChevronUp,
-  Sparkles, ArrowDown, Info, Radar, Gauge, X, GitCompare,
+  Sparkles, ArrowDown, Info, Radar, Gauge, X, GitCompare, Microscope,
+  Search, List, BookOpen, BookMarked, Clock,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -14,6 +15,7 @@ import { ErrorState } from "@/components/ui/error-state";
 import { VerifiedQuoteItem } from "@/lib/chat/streamParser";
 import { CoverageObject } from "@/lib/coverage";
 import { isExistenceOrAbsenceQuestion, ScanEstimate } from "@/lib/chat/deepScan";
+import { AgentStep } from "@/lib/agent/run";
 
 export interface ConversationSummary {
   id: string;
@@ -29,8 +31,134 @@ export interface ChatMessageUI {
   status: "complete" | "stopped" | "error";
   quotes?: VerifiedQuoteItem[] | null;
   coverage?: CoverageObject | null;
+  trace?: AgentStep[] | null;
   createdAt?: string;
   isStreaming?: boolean;
+  isAgentMode?: boolean;
+}
+
+// ── Agent Timeline Component ──────────────────────────────────────────────────
+
+function toolIcon(toolName: string) {
+  switch (toolName) {
+    case "list_clauses": return <List className="w-3.5 h-3.5" />;
+    case "search_document": return <Search className="w-3.5 h-3.5" />;
+    case "get_section": return <BookOpen className="w-3.5 h-3.5" />;
+    case "get_page": return <BookMarked className="w-3.5 h-3.5" />;
+    default: return <Microscope className="w-3.5 h-3.5" />;
+  }
+}
+
+function AgentTimeline({
+  steps,
+  done,
+  totalRounds,
+  stoppedReason,
+  startMs,
+}: {
+  steps: AgentStep[];
+  done: boolean;
+  totalRounds?: number;
+  stoppedReason?: string;
+  startMs: number;
+}) {
+  const [expanded, setExpanded] = useState(true);
+  const elapsedSec = Math.round((Date.now() - startMs) / 1000);
+
+  const doneSteps = steps.filter((s) => s.status === "done" || s.status === "error");
+  const runningStep = steps.find((s) => s.status === "running");
+
+  if (done && doneSteps.length === 0) return null;
+
+  return (
+    <div className="rounded-[14px] border-2 border-[#5267A8]/30 bg-[#5267A8]/5 p-4 shadow-[0_4px_20px_rgba(82,103,168,0.08)] space-y-3">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <button
+          onClick={() => setExpanded((e) => !e)}
+          className="flex items-center gap-2 text-xs font-semibold text-[#5267A8] hover:text-[#43548a] transition-colors"
+        >
+          <Microscope className="w-4 h-4" />
+          {done
+            ? `Researched in ${doneSteps.length} step${doneSteps.length !== 1 ? "s" : ""}${elapsedSec > 0 ? ` · ${elapsedSec}s` : ""}`
+            : `Deep Research · Step ${doneSteps.length + 1} of ${steps[0]?.maxRounds || 6}`}
+          {expanded ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+        </button>
+        {!done && runningStep && (
+          <span className="text-[11px] text-[#5267A8] flex items-center gap-1">
+            <Spinner size="sm" className="text-[#5267A8]" />
+            {runningStep.label}
+          </span>
+        )}
+      </div>
+
+      {/* Stop reason warning */}
+      {done && stoppedReason && stoppedReason !== "finished" && (
+        <div className="px-3 py-2 rounded-[8px] bg-amber-50 border border-amber-200 text-[11px] text-amber-700 flex items-center gap-1.5">
+          <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
+          {stoppedReason === "round_cap" && "Research stopped at the step limit — answer may be incomplete."}
+          {stoppedReason === "token_cap" && "Research stopped due to token budget — answer may be incomplete."}
+          {stoppedReason === "wall_clock" && "Research stopped at the time limit — answer may be incomplete."}
+          {stoppedReason === "consecutive_invalid" && "Research stopped after repeated invalid tool calls."}
+          {stoppedReason === "aborted" && "Research was stopped by the user."}
+        </div>
+      )}
+
+      {/* Step list */}
+      {expanded && (
+        <div className="space-y-1.5">
+          {steps.map((step, i) => (
+            <div
+              key={i}
+              className={`flex items-start gap-2.5 px-3 py-2 rounded-[10px] transition-colors ${
+                step.status === "running"
+                  ? "bg-[#5267A8]/10 border border-[#5267A8]/20"
+                  : step.status === "error"
+                  ? "bg-red-50 border border-red-100"
+                  : "bg-white/70 border border-[#E7E2D9]"
+              }`}
+            >
+              {/* Icon */}
+              <div className={`flex-shrink-0 mt-0.5 ${
+                step.status === "running" ? "text-[#5267A8] animate-spin" :
+                step.status === "error" ? "text-red-500" :
+                "text-[#3F7D58]"
+              }`}>
+                {step.status === "running" ? <Spinner size="sm" className="text-[#5267A8]" /> :
+                 step.status === "error" ? <AlertTriangle className="w-3.5 h-3.5" /> :
+                 <CheckCircle2 className="w-3.5 h-3.5" />}
+              </div>
+
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className={`text-[11px] font-medium ${
+                    step.status === "running" ? "text-[#5267A8]" :
+                    step.status === "error" ? "text-red-600" :
+                    "text-[#171717]"
+                  }`}>{step.label}</span>
+                  {step.elapsedMs && step.status === "done" && (
+                    <span className="text-[10px] text-[#77736C] flex items-center gap-0.5 ml-auto flex-shrink-0">
+                      <Clock className="w-2.5 h-2.5" />{(step.elapsedMs / 1000).toFixed(1)}s
+                    </span>
+                  )}
+                </div>
+                <div className={`inline-flex items-center gap-1 mt-0.5 text-[10px] ${
+                  step.status === "running" ? "text-[#5267A8]/70" :
+                  step.status === "error" ? "text-red-400" :
+                  "text-[#77736C]"
+                }`}>
+                  {toolIcon(step.tool)}
+                  <span className="capitalize">{step.tool.replace(/_/g, " ")}</span>
+                  <span className="text-[#B3AEA7]">·</span>
+                  <span>Round {step.round}</span>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 interface ChatInterfaceProps {
@@ -85,6 +213,12 @@ export function ChatInterface({ documentId: propDocId, initialConversationId }: 
   const [showScrollBottom, setShowScrollBottom] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // Deep Research mode
+  const [deepResearch, setDeepResearch] = useState(false);
+  const [agentSteps, setAgentSteps] = useState<AgentStep[]>([]);
+  const [agentDone, setAgentDone] = useState(false);
+  const [agentDoneInfo, setAgentDoneInfo] = useState<{ totalRounds: number; stoppedReason: string } | null>(null);
+  const agentStartMsRef = useRef<number>(0);
 
   // derived label maps
   const labelToDocId: Record<string, string> = {};
@@ -168,10 +302,15 @@ export function ChatInterface({ documentId: propDocId, initialConversationId }: 
     setMessages([]);
   };
 
-  const handleSend = async (questionText?: string, forcedMode: "auto" | "scan" | "quick" = "auto") => {
+  const handleSend = async (questionText?: string, forcedMode: "auto" | "scan" | "quick" | "agent" = "auto") => {
     const q = (questionText || inputQuestion).trim();
     if (!q || streaming || selectedDocIds.length === 0) return;
-    if (!isMultiDoc && forcedMode === "auto") {
+
+    // Deep research mode overrides quick send
+    const effectiveMode: "auto" | "scan" | "quick" | "agent" =
+      forcedMode !== "auto" ? forcedMode : deepResearch ? "agent" : "auto";
+
+    if (!isMultiDoc && effectiveMode === "auto") {
       const isExistence = isExistenceOrAbsenceQuestion(q).isExistence;
       if (isExistence && pageCount >= 15 && !pendingScanConfirm) {
         try {
@@ -185,18 +324,27 @@ export function ChatInterface({ documentId: propDocId, initialConversationId }: 
     setFetchError(null);
     setStreaming(true);
     setScanProgress(null);
-    setStreamStatus(isMultiDoc ? `Comparing ${selectedDocIds.length} documents…` : forcedMode === "scan" ? "Starting deep scan…" : "Analyzing query…");
+    // Reset agent state
+    setAgentSteps([]);
+    setAgentDone(false);
+    setAgentDoneInfo(null);
+    agentStartMsRef.current = Date.now();
+    setStreamStatus(
+      effectiveMode === "agent" ? "Deep research starting…" :
+      isMultiDoc ? `Comparing ${selectedDocIds.length} documents…` :
+      effectiveMode === "scan" ? "Starting deep scan…" : "Analyzing query…"
+    );
     const tempUserMsgId = crypto.randomUUID();
     const tempAssistantMsgId = crypto.randomUUID();
     setMessages((prev) => [
       ...prev,
       { id: tempUserMsgId, role: "user", content: q, status: "complete", createdAt: new Date().toISOString() },
-      { id: tempAssistantMsgId, role: "assistant", content: "", status: "complete", isStreaming: true, quotes: [], createdAt: new Date().toISOString() },
+      { id: tempAssistantMsgId, role: "assistant", content: "", status: "complete", isStreaming: true, quotes: [], isAgentMode: effectiveMode === "agent", createdAt: new Date().toISOString() },
     ]);
     const abortController = new AbortController();
     abortControllerRef.current = abortController;
     try {
-      const body: any = { question: q, conversationId: activeConvId, mode: forcedMode };
+      const body: any = { question: q, conversationId: activeConvId, mode: effectiveMode };
       if (isMultiDoc) body.documentIds = selectedDocIds; else body.documentId = primaryDocId;
       const response = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: abortController.signal });
       if (!response.ok) { const ed = await response.json().catch(() => ({})); throw new Error(ed.error || `HTTP ${response.status}`); }
@@ -231,6 +379,8 @@ export function ChatInterface({ documentId: propDocId, initialConversationId }: 
               case "token": setMessages((prev) => prev.map((m) => (m.id === tempAssistantMsgId || m.isStreaming) ? { ...m, content: m.content + parsed.text } : m)); break;
               case "quotes": setMessages((prev) => prev.map((m) => (m.id === tempAssistantMsgId || m.isStreaming) ? { ...m, quotes: parsed.items } : m)); break;
               case "coverage": setMessages((prev) => prev.map((m) => (m.id === tempAssistantMsgId || m.isStreaming) ? { ...m, coverage: parsed } : m)); break;
+              case "agent_step": setAgentSteps((prev) => { const existing = prev.findIndex((s) => s.round === parsed.round && s.tool === parsed.tool && s.status === "running"); if (parsed.status === "done" || parsed.status === "error") { const idx = prev.findIndex((s) => s.round === parsed.round && s.tool === parsed.tool); if (idx !== -1) { const next = [...prev]; next[idx] = parsed; return next; } return [...prev, parsed]; } return existing !== -1 ? prev : [...prev, parsed]; }); break;
+              case "agent_done": setAgentDone(true); setAgentDoneInfo({ totalRounds: parsed.totalRounds, stoppedReason: parsed.stoppedReason }); setMessages((prev) => prev.map((m) => (m.id === tempAssistantMsgId || m.isStreaming) ? { ...m, trace: parsed.trace } : m)); break;
               case "error": setMessages((prev) => prev.map((m) => (m.id === tempAssistantMsgId || m.isStreaming) ? { ...m, status: "error", content: m.content || `Error: ${parsed.message}`, isStreaming: false } : m)); setFetchError(parsed.message); break;
               case "done": setMessages((prev) => prev.map((m) => (m.id === tempAssistantMsgId || m.isStreaming) ? { ...m, isStreaming: false } : m)); fetchUsage(); break;
             }
@@ -379,9 +529,22 @@ export function ChatInterface({ documentId: propDocId, initialConversationId }: 
             const verifiedCount = (msg.quotes || []).filter((q) => q.status === "verified").length;
             const zeroVerifiedWarning = !isUser && !msg.isStreaming && hasQuotes && verifiedCount === 0;
             const isGuardedWarning = !isUser && msg.content.includes("⚠️ Note: I only read pages");
+            const hasMsgTrace = !isUser && msg.trace && msg.trace.length > 0;
 
             return (
               <div key={msg.id} className={`flex flex-col ${isUser ? "items-end" : "items-start"}`}>
+                {/* Persist agent trace on history messages */}
+                {hasMsgTrace && (
+                  <div className="mb-2 w-full max-w-[85%]">
+                    <AgentTimeline
+                      steps={msg.trace!}
+                      done={true}
+                      totalRounds={msg.trace!.filter((s) => s.status === "done" || s.status === "error").length}
+                      stoppedReason="finished"
+                      startMs={new Date(msg.createdAt || Date.now()).getTime()}
+                    />
+                  </div>
+                )}
                 <div className={`max-w-[85%] rounded-[16px] p-5 shadow-[0_4px_20px_rgba(0,0,0,0.03)] border ${isUser ? "bg-[#171717] text-white border-[#171717]" : "bg-[#FCFBF8] border-[#E7E2D9] text-[#171717]"}`}>
                   {isUser ? <p className="text-xs leading-relaxed whitespace-pre-wrap">{msg.content}</p> : (
                     <div className="space-y-3">
@@ -468,6 +631,17 @@ export function ChatInterface({ documentId: propDocId, initialConversationId }: 
             );
           })}
 
+          {/* Agent Timeline (live, while streaming) */}
+          {streaming && agentSteps.length > 0 && (
+            <AgentTimeline
+              steps={agentSteps}
+              done={agentDone}
+              totalRounds={agentDoneInfo?.totalRounds}
+              stoppedReason={agentDoneInfo?.stoppedReason}
+              startMs={agentStartMsRef.current}
+            />
+          )}
+
           {scanProgress && (
             <div className="rounded-[16px] bg-[#FCFBF8] border-2 border-[#5267A8] p-5 shadow-[0_4px_20px_rgba(82,103,168,0.08)] space-y-3">
               <div className="flex items-center justify-between">
@@ -532,12 +706,35 @@ export function ChatInterface({ documentId: propDocId, initialConversationId }: 
                 {selectedDocIds.length >= 5 && <span className="text-[10px] text-[#77736C] italic ml-1">Max 5 documents</span>}
               </div>
             )}
+            {/* Deep Research toggle */}
+            <div className="flex items-center justify-between">
+              <button
+                id="deep-research-toggle"
+                type="button"
+                onClick={() => setDeepResearch((d) => !d)}
+                disabled={streaming}
+                className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-[11px] font-semibold border transition-all ${
+                  deepResearch
+                    ? "bg-[#5267A8] text-white border-[#5267A8] shadow-sm"
+                    : "bg-[#F7F5F0] text-[#77736C] border-[#E7E2D9] hover:border-[#5267A8]/40 hover:text-[#5267A8]"
+                } ${streaming ? "opacity-50 cursor-not-allowed" : "cursor-pointer"}`}
+                title={deepResearch ? "Switch to Quick Answer" : "Enable Deep Research (tool calls)"}
+              >
+                <Microscope className="w-3.5 h-3.5" />
+                {deepResearch ? "Deep Research" : "Quick Answer"}
+              </button>
+              {deepResearch && (
+                <span className="text-[10px] text-[#5267A8] italic ml-2">
+                  Uses tools · up to 6 steps · verified quotes
+                </span>
+              )}
+            </div>
             <div className="flex items-end gap-2">
               <div className="relative flex-1 bg-[#F7F5F0] border border-[#E7E2D9] rounded-[14px] focus-within:border-[#F97316] focus-within:ring-1 focus-within:ring-[#F97316] transition-all">
                 <textarea ref={textareaRef} value={inputQuestion} onChange={(e) => setInputQuestion(e.target.value)}
                   onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(); } }}
                   disabled={streaming || selectedDocIds.length === 0}
-                  placeholder={selectedDocIds.length === 0 ? "Please select or upload a contract first" : isMultiDoc ? `Compare across ${selectedDocIds.length} documents (Enter to send)…` : "Ask a question about this contract (Enter to send, Shift+Enter for newline)…"}
+                  placeholder={selectedDocIds.length === 0 ? "Please select or upload a contract first" : deepResearch ? "Ask anything — the AI will research the contract using tools…" : isMultiDoc ? `Compare across ${selectedDocIds.length} documents (Enter to send)…` : "Ask a question about this contract (Enter to send, Shift+Enter for newline)…"}
                   rows={1} className="w-full bg-transparent px-4 py-3 text-xs text-[#171717] placeholder:text-[#77736C] resize-none focus:outline-none min-h-[44px] max-h-36"
                 />
               </div>
