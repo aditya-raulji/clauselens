@@ -2,12 +2,13 @@ import { NextRequest, NextResponse } from "next/server";
 import { eq } from "drizzle-orm";
 import { db } from "@/lib/db";
 import { comparisons, documents } from "@/lib/schema";
-import { aiClient } from "@/lib/ai/client";
+import { runCompare } from "@/lib/compare/pipeline";
+import { ComparisonResult } from "@/lib/compare/types";
 
-export const maxDuration = 60;
+export const maxDuration = 120;
 
 /**
- * POST /api/comparisons — run side-by-side clause comparison
+ * POST /api/comparisons — run full clause-level comparison pipeline
  */
 export async function POST(req: NextRequest) {
   try {
@@ -21,90 +22,54 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Fetch both documents (metadata + canonical text)
+    if (docAId === docBId) {
+      return NextResponse.json(
+        { error: "Select two different documents to compare" },
+        { status: 400 }
+      );
+    }
+
+    // Fetch both documents
     const [docA] = await db
-      .select({
-        id: documents.id,
-        name: documents.name,
-        canonicalText: documents.canonicalText,
-      })
+      .select({ id: documents.id, name: documents.name, canonicalText: documents.canonicalText, status: documents.status })
       .from(documents)
       .where(eq(documents.id, docAId))
       .limit(1);
 
     const [docB] = await db
-      .select({
-        id: documents.id,
-        name: documents.name,
-        canonicalText: documents.canonicalText,
-      })
+      .select({ id: documents.id, name: documents.name, canonicalText: documents.canonicalText, status: documents.status })
       .from(documents)
       .where(eq(documents.id, docBId))
       .limit(1);
 
-    if (!docA || !docB) {
-      return NextResponse.json(
-        { error: "One or both documents not found" },
-        { status: 404 }
-      );
+    if (!docA) return NextResponse.json({ error: `Document A not found` }, { status: 404 });
+    if (!docB) return NextResponse.json({ error: `Document B not found` }, { status: 404 });
+    if (docA.status !== "ready") return NextResponse.json({ error: `Document A is not ready (status: ${docA.status})` }, { status: 422 });
+    if (docB.status !== "ready") return NextResponse.json({ error: `Document B is not ready (status: ${docB.status})` }, { status: 422 });
+
+    if (!docA.canonicalText || !docB.canonicalText) {
+      return NextResponse.json({ error: "One or both documents have no extracted text" }, { status: 422 });
     }
 
-    // Truncate to stay within TPM budget (~4000 chars per doc = ~1000 tokens)
-    const MAX_CHARS = 3500;
-    const textA = (docA.canonicalText || "").substring(0, MAX_CHARS);
-    const textB = (docB.canonicalText || "").substring(0, MAX_CHARS);
-    const truncatedNote =
-      (docA.canonicalText?.length || 0) > MAX_CHARS ||
-      (docB.canonicalText?.length || 0) > MAX_CHARS
-        ? `\n[NOTE: Documents were truncated to ~${MAX_CHARS} characters each due to token budget limits. Analysis covers the opening sections only.]`
-        : "";
-
-    const systemPrompt = `You are a legal contract comparison assistant. Compare the two agreements clause by clause. Be concise. Return a JSON object with this exact structure:
-{
-  "summary": "short 2-3 sentence comparison summary",
-  "similarities": ["bullet 1", "bullet 2"],
-  "differences": ["bullet 1", "bullet 2"],
-  "notable_clauses_a": ["clause or gap unique to A"],
-  "notable_clauses_b": ["clause or gap unique to B"]
-}`;
-
-    const userPrompt = `DOCUMENT A — ${docA.name}:\n${textA}\n\n===\n\nDOCUMENT B — ${docB.name}:\n${textB}${truncatedNote}\n\nProvide the JSON comparison result.`;
-
-    const result = await aiClient.chat({
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-      maxTokens: 1000,
-      temperature: 0.05,
+    // Run comparison pipeline (no SSE, just await; max 120s)
+    const result: ComparisonResult = await runCompare({
+      docAId: docA.id,
+      docAName: docA.name,
+      textA: docA.canonicalText,
+      docBId: docB.id,
+      docBName: docB.name,
+      textB: docB.canonicalText,
     });
 
-    // Parse JSON result from AI response
-    let comparisonResult: any = null;
-    try {
-      const jsonMatch = result.content.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        comparisonResult = JSON.parse(jsonMatch[0]);
-      }
-    } catch {
-      comparisonResult = { summary: result.content, raw: true };
-    }
-
-    // Save comparison to DB
+    // Persist result to DB
     const [saved] = await db
       .insert(comparisons)
-      .values({
-        docA: docAId,
-        docB: docBId,
-        result: comparisonResult,
-      })
+      .values({ docA: docAId, docB: docBId, result })
       .returning();
 
-    return NextResponse.json({
-      comparison: saved,
-      result: comparisonResult,
-    });
+    return NextResponse.json({ comparison: saved, result });
   } catch (error: any) {
+    console.error("[comparisons POST]", error);
     return NextResponse.json(
       { error: "Comparison failed", details: error?.message },
       { status: 500 }
@@ -113,16 +78,22 @@ export async function POST(req: NextRequest) {
 }
 
 /**
- * GET /api/comparisons — list saved comparisons
+ * GET /api/comparisons — list saved comparisons (with document names joined)
  */
 export async function GET() {
   try {
-    const list = await db
-      .select()
+    const rows = await db
+      .select({
+        id: comparisons.id,
+        docA: comparisons.docA,
+        docB: comparisons.docB,
+        result: comparisons.result,
+        createdAt: comparisons.createdAt,
+      })
       .from(comparisons)
       .orderBy(comparisons.createdAt);
 
-    return NextResponse.json({ comparisons: list });
+    return NextResponse.json({ comparisons: rows });
   } catch (error: any) {
     return NextResponse.json(
       { error: "Failed to list comparisons", details: error?.message },
